@@ -1,6 +1,9 @@
 # Build the ForgeTaxCheat dylib and inject it into the base 3.16.1 IPA.
-# No release is published by this workflow — it only uploads the IPA
-# artifact for the owner to test on a secondary account first.
+# The base IPA is downloaded from Google Drive (the cloud browser cannot
+# attach 150 MB files to a GitHub release — no file picker), and the
+# finished IPA is published as a release on this repo by the workflow
+# itself (gh release create, GITHUB_TOKEN). The artifact upload is kept
+# as a backup.
 #
 # Hard guarantees:
 #  - UnityFramework is NEVER modified: its SHA-256 is asserted identical
@@ -12,6 +15,9 @@ name: build-cheat-ipa
 
 on:
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -38,18 +44,21 @@ jobs:
           file ForgeTaxCheat.dylib
           lipo -info ForgeTaxCheat.dylib
 
-      - name: Download base IPA (release asset)
+      - name: Download base IPA (Google Drive)
         run: |
-          URL="https://github.com/duyzoz/ForgeTax-Mobile-Cheat/releases/download/base-ipa-3.16.1/com.soucean.fruityzoo_v3.16.1_und3fined.ipa"
+          URL="https://drive.usercontent.google.com/download?id=1BGR0mja2QIQgcgsqnsfEQmIed-6v3Rl-&export=download&confirm=t"
+          EXPECTED_SHA="65f89d3496820087b9476c826c0692ecca8b61c45dbe8a05a78d42f44af87cdf"
           if ! curl -fL -o base.ipa "$URL"; then
-            echo "::error::Base IPA asset not found at $URL"
-            echo "Upload com.soucean.fruityzoo_v3.16.1_und3fined.ipa as a release asset"
-            echo "named 'base-ipa-3.16.1' in duyzoz/ForgeTax-Mobile-Cheat, then re-run."
-            echo "No other download source is used."
+            echo "::error::Base IPA download failed from $URL"
             exit 1
           fi
           ls -la base.ipa
-          shasum -a 256 base.ipa
+          ACTUAL_SHA=$(shasum -a 256 base.ipa | awk '{print $1}')
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::Base IPA SHA-256 mismatch: got $ACTUAL_SHA, expected $EXPECTED_SHA"
+            exit 1
+          fi
+          echo "Base IPA SHA-256 verified."
 
       - name: Verify patch table against the base IPA
         run: |
@@ -128,3 +137,20 @@ jobs:
           path: |
             ForgeTax-Cheat-3.16.1.ipa
             ForgeTax-Cheat-3.16.1.ipa.sha256
+
+      - name: Publish release (this repo)
+        # The cloud browser cannot attach 150 MB files to a GitHub release
+        # (no file picker), so the workflow publishes the finished IPA
+        # itself on the repo it runs on (the huyzoz build fork).
+        # Uses the default GITHUB_TOKEN (needs contents: write).
+        run: |
+          if gh release view v3.16.1-cheat >/dev/null 2>&1; then
+            gh release upload v3.16.1-cheat --clobber \
+              ForgeTax-Cheat-3.16.1.ipa ForgeTax-Cheat-3.16.1.ipa.sha256
+          else
+            gh release create v3.16.1-cheat \
+              --title "ForgeTax iOS 3.16.1 — Cheat" \
+              --notes-file RELEASE-NOTES.md \
+              ForgeTax-Cheat-3.16.1.ipa ForgeTax-Cheat-3.16.1.ipa.sha256
+          fi
+          gh release view v3.16.1-cheat --json tagName,url,assets --jq '{url, assets: [.assets[] | .name]}'
