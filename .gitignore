@@ -1,0 +1,18 @@
+# Build artifacts
+*.ipa
+*.dylib
+*.o
+*.a
+work/
+build/
+DerivedData/
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS / editors
+.DS_Store
+*.swp
+.vscode/
+.idea/
