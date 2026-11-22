@@ -1,0 +1,130 @@
+# Build the ForgeTaxCheat dylib and inject it into the base 3.16.1 IPA.
+# No release is published by this workflow — it only uploads the IPA
+# artifact for the owner to test on a secondary account first.
+#
+# Hard guarantees:
+#  - UnityFramework is NEVER modified: its SHA-256 is asserted identical
+#    before injection and after repacking; any difference fails the job.
+#  - The dylib is built directly with clang (no Xcode project to drift).
+#  - patch_table.h must be in sync with patch_table_verified.json
+#    (regenerated and diffed); a drift fails the job.
+name: build-cheat-ipa
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check patch_table.h is in sync with the verified JSON
+        run: |
+          python3 scripts/patch_table_to_header.py patch_table_verified.json /tmp/patch_table_check.h
+          diff -u src/patch_table.h /tmp/patch_table_check.h
+
+      - name: Build ForgeTaxCheat.dylib (arm64, iOS 15.0)
+        run: |
+          xcrun --sdk iphoneos clang -arch arm64 -mios-version-min=15.0 \
+            -dynamiclib -fobjc-arc -O2 -Wall \
+            -install_name @executable_path/Frameworks/ForgeTaxCheat.dylib \
+            -framework Foundation -framework UIKit \
+            -framework CoreGraphics -framework QuartzCore \
+            src/ForgeTaxCheat.mm src/CheatMenuView.mm \
+            src/PatchEngine.mm src/GameBridge.mm \
+            -o ForgeTaxCheat.dylib
+          file ForgeTaxCheat.dylib
+          lipo -info ForgeTaxCheat.dylib
+
+      - name: Download base IPA (release asset)
+        run: |
+          URL="https://github.com/duyzoz/ForgeTax-Mobile-Cheat/releases/download/base-ipa-3.16.1/com.soucean.fruityzoo_v3.16.1_und3fined.ipa"
+          if ! curl -fL -o base.ipa "$URL"; then
+            echo "::error::Base IPA asset not found at $URL"
+            echo "Upload com.soucean.fruityzoo_v3.16.1_und3fined.ipa as a release asset"
+            echo "named 'base-ipa-3.16.1' in duyzoz/ForgeTax-Mobile-Cheat, then re-run."
+            echo "No other download source is used."
+            exit 1
+          fi
+          ls -la base.ipa
+          shasum -a 256 base.ipa
+
+      - name: Verify patch table against the base IPA
+        run: |
+          python3 scripts/verify_patch_table.py patch_table_verified.json --ipa base.ipa
+
+      - name: Unpack IPA
+        run: |
+          mkdir -p work && cd work
+          unzip -q ../base.ipa
+          ls Payload/
+          APP=$(ls -d Payload/*.app)
+          echo "APP=$APP" >> $GITHUB_ENV
+          # Record UnityFramework hash BEFORE any modification.
+          shasum -a 256 "$APP/Frameworks/UnityFramework.framework/UnityFramework" | tee ../unity-before.txt
+
+      - name: Inject dylib load command (LIEF)
+        run: |
+          pip install lief
+          python3 scripts/inject_dylib.py "work/$APP" "@executable_path/Frameworks/ForgeTaxCheat.dylib"
+          mkdir -p "work/$APP/Frameworks"
+          cp ForgeTaxCheat.dylib "work/$APP/Frameworks/ForgeTaxCheat.dylib"
+
+      - name: Assert UnityFramework unchanged
+        run: |
+          shasum -a 256 "work/$APP/Frameworks/UnityFramework.framework/UnityFramework" | tee unity-after.txt
+          diff unity-before.txt unity-after.txt || {
+            echo "::error::UnityFramework changed during the build — refusing to ship."
+            exit 1
+          }
+
+      - name: Repack IPA
+        run: |
+          cd work
+          zip -r -y ../ForgeTax-Cheat-3.16.1.ipa Payload >/dev/null
+          cd ..
+          shasum -a 256 ForgeTax-Cheat-3.16.1.ipa | tee ForgeTax-Cheat-3.16.1.ipa.sha256
+          ls -la ForgeTax-Cheat-3.16.1.ipa
+
+      - name: Fake-sign with ldid (best effort)
+        run: |
+          brew install ldid || true
+          if command -v ldid >/dev/null; then
+            ldid -S "work/$APP" || echo "::warning::ldid failed on the .app — IPA still uploaded, sign it manually if TrollStore refuses it."
+            ldid -S "work/$APP/Frameworks/ForgeTaxCheat.dylib" || echo "::warning::ldid failed on the dylib."
+            # Re-pack after signing (signing rewrites files in place).
+            cd work
+            zip -r -y ../ForgeTax-Cheat-3.16.1.ipa Payload >/dev/null
+            cd ..
+            shasum -a 256 ForgeTax-Cheat-3.16.1.ipa | tee ForgeTax-Cheat-3.16.1.ipa.sha256
+          else
+            echo "::warning::ldid not available — IPA uploaded unsigned (TrollStore install may still work)."
+          fi
+
+      - name: Assert LC_LOAD_DYLIB present in final IPA
+        # Independent check that the cheat actually loads: read the main
+        # executable out of the FINAL repacked IPA (after ldid re-pack)
+        # and fail if it has no load command for ForgeTaxCheat.dylib.
+        # (AEGIS fix: the workflow previously asserted only the
+        # UnityFramework SHA, so a silent inject failure would still
+        # upload an IPA without the cheat.)
+        run: |
+          rm -rf /tmp/final-ipa-check && mkdir -p /tmp/final-ipa-check
+          unzip -q ForgeTax-Cheat-3.16.1.ipa -d /tmp/final-ipa-check
+          EXE="/tmp/final-ipa-check/$APP/$(basename "$APP" .app)"
+          if ! otool -l "$EXE" | grep -q "@executable_path/Frameworks/ForgeTaxCheat.dylib"; then
+            echo "::error::Final IPA has no LC_LOAD_DYLIB for @executable_path/Frameworks/ForgeTaxCheat.dylib in $EXE"
+            otool -l "$EXE" | grep -i "dylib" || true
+            exit 1
+          fi
+          echo "LC_LOAD_DYLIB @executable_path/Frameworks/ForgeTaxCheat.dylib present in final IPA."
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ForgeTax-Cheat-3.16.1.ipa
+          path: |
+            ForgeTax-Cheat-3.16.1.ipa
+            ForgeTax-Cheat-3.16.1.ipa.sha256
